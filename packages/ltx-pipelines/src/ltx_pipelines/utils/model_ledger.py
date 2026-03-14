@@ -1,3 +1,4 @@
+import os
 from dataclasses import replace
 
 import torch
@@ -193,6 +194,14 @@ class ModelLedger:
         else:
             return torch.device("cpu")
 
+    def _runtime_device(self, env_var: str, fallback_env_var: str | None = None) -> torch.device:
+        device_name = os.environ.get(env_var)
+        if device_name is None and fallback_env_var is not None:
+            device_name = os.environ.get(fallback_env_var)
+        if device_name is None:
+            return self.device
+        return torch.device(device_name)
+
     def with_additional_loras(self, loras: tuple[LoraPathStrengthAndSDOps, ...]) -> "ModelLedger":
         """Add new lora configurations to the existing ones."""
         return self.with_loras((*self.loras, *loras))
@@ -259,7 +268,9 @@ class ModelLedger:
                 "ModelLedger constructor."
             )
 
-        return self.text_encoder_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device).eval()
+        runtime_device = self._runtime_device("LTX_PROMPT_ENCODER_DEVICE")
+        build_device = runtime_device if runtime_device.type == "cpu" else self._target_device()
+        return self.text_encoder_builder.build(device=build_device, dtype=self.dtype).to(runtime_device).eval()
 
     def gemma_embeddings_processor(self) -> EmbeddingsProcessor:
         if not hasattr(self, "embeddings_processor_builder"):
@@ -267,9 +278,11 @@ class ModelLedger:
                 "Embeddings processor not initialized. Please provide a checkpoint path to the ModelLedger constructor."
             )
 
+        runtime_device = self._runtime_device("LTX_PROMPT_EMBEDDINGS_DEVICE", fallback_env_var="LTX_PROMPT_ENCODER_DEVICE")
+        build_device = runtime_device if runtime_device.type == "cpu" else self._target_device()
         return (
-            self.embeddings_processor_builder.build(device=self._target_device(), dtype=self.dtype)
-            .to(self.device)
+            self.embeddings_processor_builder.build(device=build_device, dtype=self.dtype)
+            .to(runtime_device)
             .eval()
         )
 

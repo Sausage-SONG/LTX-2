@@ -78,9 +78,16 @@ def encode_prompts(
     cleanup_memory()
 
     embeddings_processor = model_ledger.gemma_embeddings_processor()
-    results: list[EmbeddingsProcessorOutput] = [
-        embeddings_processor.process_hidden_states(hs, mask) for hs, mask in raw_outputs
-    ]
+    results: list[EmbeddingsProcessorOutput] = []
+    for hs, mask in raw_outputs:
+        output = embeddings_processor.process_hidden_states(hs, mask)
+        if output.video_encoding.device != model_ledger.device:
+            output = EmbeddingsProcessorOutput(
+                video_encoding=output.video_encoding.to(model_ledger.device),
+                audio_encoding=output.audio_encoding.to(model_ledger.device) if output.audio_encoding is not None else None,
+                attention_mask=output.attention_mask.to(model_ledger.device),
+            )
+        results.append(output)
     del embeddings_processor
     cleanup_memory()
     return results
