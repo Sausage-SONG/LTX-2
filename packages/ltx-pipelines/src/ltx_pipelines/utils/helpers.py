@@ -1,6 +1,7 @@
 import gc
 import logging
 from dataclasses import replace
+from pathlib import Path
 
 import torch
 
@@ -91,6 +92,56 @@ def encode_prompts(
     del embeddings_processor
     cleanup_memory()
     return results
+
+
+def save_prompt_embeddings(
+    path: str | Path,
+    embeddings: EmbeddingsProcessorOutput,
+    *,
+    prompt: str | None = None,
+) -> None:
+    """Save prompt embeddings to disk for later reuse."""
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "format": "ltx_prompt_embeddings",
+            "version": 1,
+            "prompt": prompt,
+            "video_encoding": embeddings.video_encoding.detach().cpu(),
+            "audio_encoding": embeddings.audio_encoding.detach().cpu() if embeddings.audio_encoding is not None else None,
+            "attention_mask": embeddings.attention_mask.detach().cpu(),
+        },
+        output_path,
+    )
+
+
+def load_prompt_embeddings(
+    path: str | Path,
+    *,
+    device: torch.device | None = None,
+) -> EmbeddingsProcessorOutput:
+    """Load prompt embeddings saved by :func:`save_prompt_embeddings`."""
+    payload = torch.load(Path(path), map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise TypeError(f"Unsupported prompt embeddings payload type: {type(payload)!r}")
+    if payload.get("format") != "ltx_prompt_embeddings":
+        raise ValueError(f"Unsupported prompt embeddings format in {path}: {payload.get('format')!r}")
+
+    video_encoding = payload["video_encoding"]
+    audio_encoding = payload["audio_encoding"]
+    attention_mask = payload["attention_mask"]
+    if device is not None:
+        video_encoding = video_encoding.to(device)
+        if audio_encoding is not None:
+            audio_encoding = audio_encoding.to(device)
+        attention_mask = attention_mask.to(device)
+
+    return EmbeddingsProcessorOutput(
+        video_encoding=video_encoding,
+        audio_encoding=audio_encoding,
+        attention_mask=attention_mask,
+    )
 
 
 def combined_image_conditionings(

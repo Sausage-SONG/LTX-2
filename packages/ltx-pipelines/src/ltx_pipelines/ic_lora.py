@@ -19,6 +19,7 @@ from ltx_core.model.upsampler import upsample_video
 from ltx_core.model.video_vae import TilingConfig, VideoEncoder, get_video_chunks_number
 from ltx_core.model.video_vae import decode_video as vae_decode_video
 from ltx_core.quantization import QuantizationPolicy
+from ltx_core.text_encoders.gemma.embeddings_processor import EmbeddingsProcessorOutput
 from ltx_core.types import Audio, LatentState, VideoLatentShape, VideoPixelShape
 from ltx_pipelines.utils import (
     ModelLedger,
@@ -29,6 +30,8 @@ from ltx_pipelines.utils import (
     encode_prompts,
     euler_denoising_loop,
     get_device,
+    load_prompt_embeddings,
+    save_prompt_embeddings,
     simple_denoising_func,
 )
 from ltx_pipelines.utils.args import (
@@ -37,6 +40,7 @@ from ltx_pipelines.utils.args import (
     VideoMaskConditioningAction,
     default_2_stage_distilled_arg_parser,
     detect_checkpoint_path,
+    resolve_path,
 )
 from ltx_pipelines.utils.constants import (
     DISTILLED_SIGMA_VALUES,
@@ -124,6 +128,7 @@ class ICLoraPipeline:
         conditioning_attention_strength: float = 1.0,
         skip_stage_2: bool = False,
         conditioning_attention_mask: torch.Tensor | None = None,
+        prompt_embeddings: EmbeddingsProcessorOutput | None = None,
     ) -> tuple[Iterator[torch.Tensor], Audio]:
         """
         Generate video with IC-LoRA conditioning.
@@ -154,6 +159,8 @@ class ICLoraPipeline:
                 conditioning_attention_strength.
                 When None (default): scalar conditioning_attention_strength is used
                 directly.
+            prompt_embeddings: Optional precomputed prompt embeddings. When provided,
+                Gemma prompt encoding is skipped and these embeddings are used directly.
         Returns:
             Tuple of (video_iterator, audio_tensor).
         """
@@ -162,19 +169,30 @@ class ICLoraPipeline:
             raise ValueError(
                 f"conditioning_attention_strength must be in [0.0, 1.0], got {conditioning_attention_strength}"
             )
+        if prompt_embeddings is not None and enhance_prompt:
+            raise ValueError("Prompt enhancement is not supported when precomputed prompt embeddings are provided.")
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
         stepper = EulerDiffusionStep()
         dtype = torch.bfloat16
 
-        (ctx_p,) = encode_prompts(
-            [prompt],
-            self.stage_1_model_ledger,
-            enhance_first_prompt=enhance_prompt,
-            enhance_prompt_image=images[0][0] if len(images) > 0 else None,
-            enhance_prompt_seed=seed,
-        )
+        if prompt_embeddings is None:
+            (ctx_p,) = encode_prompts(
+                [prompt],
+                self.stage_1_model_ledger,
+                enhance_first_prompt=enhance_prompt,
+                enhance_prompt_image=images[0][0] if len(images) > 0 else None,
+                enhance_prompt_seed=seed,
+            )
+        else:
+            ctx_p = prompt_embeddings
+            if ctx_p.video_encoding.device != self.device:
+                ctx_p = EmbeddingsProcessorOutput(
+                    video_encoding=ctx_p.video_encoding.to(self.device),
+                    audio_encoding=ctx_p.audio_encoding.to(self.device) if ctx_p.audio_encoding is not None else None,
+                    attention_mask=ctx_p.attention_mask.to(self.device),
+                )
         video_context, audio_context = ctx_p.video_encoding, ctx_p.audio_encoding
 
         # Stage 1: Initial low resolution video generation.
@@ -488,7 +506,21 @@ def main() -> None:
             "(height//2, width//2). Useful for faster iteration or when GPU memory is limited."
         ),
     )
+    parser.add_argument(
+        "--prompt-embeddings",
+        type=resolve_path,
+        default=None,
+        help="Optional path to a saved prompt embeddings file produced by this local LTX fork.",
+    )
+    parser.add_argument(
+        "--save-prompt-embeddings",
+        type=resolve_path,
+        default=None,
+        help="Optional output path where prompt embeddings should be saved before generation.",
+    )
     args = parser.parse_args()
+    if args.prompt_embeddings is not None and args.save_prompt_embeddings is not None:
+        raise ValueError("Use either --prompt-embeddings or --save-prompt-embeddings, not both.")
 
     # Load mask video if provided via --conditioning-attention-mask
     conditioning_attention_mask = None
@@ -510,6 +542,14 @@ def main() -> None:
         loras=tuple(args.lora) if args.lora else (),
         quantization=args.quantization,
     )
+    prompt_embeddings = None
+    if args.prompt_embeddings is not None:
+        prompt_embeddings = load_prompt_embeddings(args.prompt_embeddings, device=pipeline.device)
+    elif args.save_prompt_embeddings is not None:
+        (prompt_embeddings,) = encode_prompts([args.prompt], pipeline.stage_1_model_ledger)
+        save_prompt_embeddings(args.save_prompt_embeddings, prompt_embeddings, prompt=args.prompt)
+        prompt_embeddings = load_prompt_embeddings(args.save_prompt_embeddings, device=pipeline.device)
+
     tiling_config = TilingConfig.default()
     video_chunks_number = get_video_chunks_number(args.num_frames, tiling_config)
     video, audio = pipeline(
@@ -525,6 +565,7 @@ def main() -> None:
         conditioning_attention_strength=conditioning_attention_strength,
         skip_stage_2=args.skip_stage_2,
         conditioning_attention_mask=conditioning_attention_mask,
+        prompt_embeddings=prompt_embeddings,
     )
 
     encode_video(
