@@ -6,6 +6,7 @@ import torch
 from ltx_core.loader import SDOps
 from ltx_core.loader.primitives import LoraPathStrengthAndSDOps
 from ltx_core.loader.registry import DummyRegistry, Registry
+from ltx_core.loader.sharded_transformer_builder import BlockShardedTransformerBuilder
 from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder as Builder
 from ltx_core.model.audio_vae import (
     AUDIO_VAE_DECODER_COMFY_KEYS_FILTER,
@@ -104,6 +105,8 @@ class ModelLedger:
         loras: tuple[LoraPathStrengthAndSDOps, ...] = (),
         registry: Registry | None = None,
         quantization: QuantizationPolicy | None = None,
+        transformer_shard_devices: tuple[torch.device, ...] | None = None,
+        transformer_shard_boundaries: tuple[int, ...] | None = None,
     ):
         self.dtype = dtype
         self.device = device
@@ -113,6 +116,9 @@ class ModelLedger:
         self.loras = loras
         self.registry = registry or DummyRegistry()
         self.quantization = quantization
+        self.transformer_shard_devices = transformer_shard_devices
+        self.transformer_shard_boundaries = transformer_shard_boundaries
+        self.text_encoder_init_error: str | None = None
         self.build_model_builders()
 
     def build_model_builders(self) -> None:
@@ -169,17 +175,22 @@ class ModelLedger:
             )
 
             if self.gemma_root_path is not None:
-                module_ops = module_ops_from_gemma_root(self.gemma_root_path)
-                model_folder = find_matching_file(self.gemma_root_path, "model*.safetensors").parent
-                weight_paths = [str(p) for p in model_folder.rglob("*.safetensors")]
+                try:
+                    module_ops = module_ops_from_gemma_root(self.gemma_root_path)
+                    model_folder = find_matching_file(self.gemma_root_path, "model*.safetensors").parent
+                except FileNotFoundError as exc:
+                    # Prompt-embedding runs do not need Gemma assets at construction time.
+                    self.text_encoder_init_error = str(exc)
+                else:
+                    weight_paths = [str(p) for p in model_folder.rglob("*.safetensors")]
 
-                self.text_encoder_builder = Builder(
-                    model_path=tuple(weight_paths),
-                    model_class_configurator=GemmaTextEncoderConfigurator,
-                    model_sd_ops=GEMMA_LLM_KEY_OPS,
-                    registry=self.registry,
-                    module_ops=(GEMMA_MODEL_OPS, *module_ops),
-                )
+                    self.text_encoder_builder = Builder(
+                        model_path=tuple(weight_paths),
+                        model_class_configurator=GemmaTextEncoderConfigurator,
+                        model_sd_ops=GEMMA_LLM_KEY_OPS,
+                        registry=self.registry,
+                        module_ops=(GEMMA_MODEL_OPS, *module_ops),
+                    )
 
         if self.spatial_upsampler_path is not None:
             self.upsampler_builder = Builder(
@@ -217,12 +228,28 @@ class ModelLedger:
             loras=loras,
             registry=self.registry,
             quantization=self.quantization,
+            transformer_shard_devices=self.transformer_shard_devices,
+            transformer_shard_boundaries=self.transformer_shard_boundaries,
         )
 
     def transformer(self) -> X0Model:
         if not hasattr(self, "transformer_builder"):
             raise ValueError(
                 "Transformer not initialized. Please provide a checkpoint path to the ModelLedger constructor."
+            )
+
+        if self.transformer_shard_devices is not None:
+            if self.quantization is not None:
+                raise NotImplementedError("Transformer block sharding is only implemented for unquantized inference.")
+            return (
+                BlockShardedTransformerBuilder(
+                    base_builder=self.transformer_builder,
+                    devices=self.transformer_shard_devices,
+                    block_boundaries=self.transformer_shard_boundaries,
+                    io_device=self.device,
+                )
+                .build(dtype=self.dtype)
+                .eval()
             )
 
         if self.quantization is None:
@@ -263,9 +290,14 @@ class ModelLedger:
 
     def text_encoder(self) -> GemmaTextEncoder:
         if not hasattr(self, "text_encoder_builder"):
+            extra = (
+                f" Gemma initialization error: {self.text_encoder_init_error}"
+                if self.text_encoder_init_error is not None
+                else ""
+            )
             raise ValueError(
                 "Text encoder not initialized. Please provide a checkpoint path and gemma root path to the "
-                "ModelLedger constructor."
+                f"ModelLedger constructor.{extra}"
             )
 
         runtime_device = self._runtime_device("LTX_PROMPT_ENCODER_DEVICE")

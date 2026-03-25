@@ -71,32 +71,51 @@ class ICLoraPipeline:
         gemma_root: str,
         loras: list[LoraPathStrengthAndSDOps],
         device: torch.device = device,
+        stage_2_device: torch.device | None = None,
         quantization: QuantizationPolicy | None = None,
+        stage_1_transformer_devices: tuple[torch.device, ...] | None = None,
+        stage_1_transformer_split: int | None = None,
+        stage_2_transformer_devices: tuple[torch.device, ...] | None = None,
+        stage_2_transformer_split: int | None = None,
     ):
+        self.stage_1_device = device
+        self.stage_2_device = stage_2_device if stage_2_device is not None else device
         self.dtype = torch.bfloat16
         self.stage_1_model_ledger = ModelLedger(
             dtype=self.dtype,
-            device=device,
+            device=self.stage_1_device,
             checkpoint_path=distilled_checkpoint_path,
             spatial_upsampler_path=spatial_upsampler_path,
             gemma_root_path=gemma_root,
             loras=loras,
             quantization=quantization,
+            transformer_shard_devices=stage_1_transformer_devices,
+            transformer_shard_boundaries=(stage_1_transformer_split,)
+            if stage_1_transformer_split is not None
+            else None,
         )
         self.stage_2_model_ledger = ModelLedger(
             dtype=self.dtype,
-            device=device,
+            device=self.stage_2_device,
             checkpoint_path=distilled_checkpoint_path,
             spatial_upsampler_path=spatial_upsampler_path,
             gemma_root_path=gemma_root,
             loras=[],
             quantization=quantization,
+            transformer_shard_devices=stage_2_transformer_devices,
+            transformer_shard_boundaries=(stage_2_transformer_split,)
+            if stage_2_transformer_split is not None
+            else None,
         )
-        self.pipeline_components = PipelineComponents(
+        self.stage_1_pipeline_components = PipelineComponents(
             dtype=self.dtype,
-            device=device,
+            device=self.stage_1_device,
         )
-        self.device = device
+        self.stage_2_pipeline_components = PipelineComponents(
+            dtype=self.dtype,
+            device=self.stage_2_device,
+        )
+        self.device = self.stage_1_device
 
         # Read reference downscale factor from LoRA metadata.
         # IC-LoRAs trained with low-resolution reference videos store this factor
@@ -172,8 +191,14 @@ class ICLoraPipeline:
         if prompt_embeddings is not None and enhance_prompt:
             raise ValueError("Prompt enhancement is not supported when precomputed prompt embeddings are provided.")
 
-        generator = torch.Generator(device=self.device).manual_seed(seed)
-        noiser = GaussianNoiser(generator=generator)
+        stage_1_generator = torch.Generator(device=self.stage_1_device).manual_seed(seed)
+        stage_1_noiser = GaussianNoiser(generator=stage_1_generator)
+        if self.stage_2_device == self.stage_1_device:
+            stage_2_generator = stage_1_generator
+            stage_2_noiser = stage_1_noiser
+        else:
+            stage_2_generator = torch.Generator(device=self.stage_2_device).manual_seed(seed)
+            stage_2_noiser = GaussianNoiser(generator=stage_2_generator)
         stepper = EulerDiffusionStep()
         dtype = torch.bfloat16
 
@@ -187,11 +212,13 @@ class ICLoraPipeline:
             )
         else:
             ctx_p = prompt_embeddings
-            if ctx_p.video_encoding.device != self.device:
+            if ctx_p.video_encoding.device != self.stage_1_device:
                 ctx_p = EmbeddingsProcessorOutput(
-                    video_encoding=ctx_p.video_encoding.to(self.device),
-                    audio_encoding=ctx_p.audio_encoding.to(self.device) if ctx_p.audio_encoding is not None else None,
-                    attention_mask=ctx_p.attention_mask.to(self.device),
+                    video_encoding=ctx_p.video_encoding.to(self.stage_1_device),
+                    audio_encoding=ctx_p.audio_encoding.to(self.stage_1_device)
+                    if ctx_p.audio_encoding is not None
+                    else None,
+                    attention_mask=ctx_p.attention_mask.to(self.stage_1_device),
                 )
         video_context, audio_context = ctx_p.video_encoding, ctx_p.audio_encoding
 
@@ -218,7 +245,7 @@ class ICLoraPipeline:
         )
 
         transformer = self.stage_1_model_ledger.transformer()
-        stage_1_sigmas = torch.Tensor(DISTILLED_SIGMA_VALUES).to(self.device)
+        stage_1_sigmas = torch.Tensor(DISTILLED_SIGMA_VALUES).to(self.stage_1_device)
 
         def first_stage_denoising_loop(
             sigmas: torch.Tensor, video_state: LatentState, audio_state: LatentState, stepper: DiffusionStepProtocol
@@ -238,13 +265,13 @@ class ICLoraPipeline:
         video_state, audio_state = denoise_audio_video(
             output_shape=stage_1_output_shape,
             conditionings=stage_1_conditionings,
-            noiser=noiser,
+            noiser=stage_1_noiser,
             sigmas=stage_1_sigmas,
             stepper=stepper,
             denoising_loop_fn=first_stage_denoising_loop,
-            components=self.pipeline_components,
+            components=self.stage_1_pipeline_components,
             dtype=dtype,
-            device=self.device,
+            device=self.stage_1_device,
         )
 
         torch.cuda.synchronize()
@@ -255,7 +282,7 @@ class ICLoraPipeline:
             # Skip Stage 2: Decode directly from Stage 1 output at half resolution
             logging.info("[IC-LoRA] Skipping Stage 2 (--skip-stage-2 enabled)")
             decoded_video = vae_decode_video(
-                video_state.latent, self.stage_1_model_ledger.video_decoder(), tiling_config, generator
+                video_state.latent, self.stage_1_model_ledger.video_decoder(), tiling_config, stage_1_generator
             )
             decoded_audio = vae_decode_audio(
                 audio_state.latent, self.stage_1_model_ledger.audio_decoder(), self.stage_1_model_ledger.vocoder()
@@ -264,7 +291,33 @@ class ICLoraPipeline:
             cleanup_memory()
             return decoded_video, decoded_audio
 
+        del video_encoder
+        cleanup_memory()
+        if self.stage_2_device != self.stage_1_device:
+            video_context = video_context.to(self.stage_2_device)
+            if audio_context is not None:
+                audio_context = audio_context.to(self.stage_2_device)
+            video_state = LatentState(
+                latent=video_state.latent.to(self.stage_2_device),
+                clean_latent=video_state.clean_latent.to(self.stage_2_device),
+                denoise_mask=video_state.denoise_mask.to(self.stage_2_device),
+                positions=video_state.positions.to(self.stage_2_device),
+                attention_mask=video_state.attention_mask.to(self.stage_2_device)
+                if video_state.attention_mask is not None
+                else None,
+            )
+            audio_state = LatentState(
+                latent=audio_state.latent.to(self.stage_2_device),
+                clean_latent=audio_state.clean_latent.to(self.stage_2_device),
+                denoise_mask=audio_state.denoise_mask.to(self.stage_2_device),
+                positions=audio_state.positions.to(self.stage_2_device),
+                attention_mask=audio_state.attention_mask.to(self.stage_2_device)
+                if audio_state.attention_mask is not None
+                else None,
+            )
+
         # Stage 2: Upsample and refine the video at higher resolution with distilled LORA.
+        video_encoder = self.stage_2_model_ledger.video_encoder()
         upscaled_video_latent = upsample_video(
             latent=video_state.latent[:1],
             video_encoder=video_encoder,
@@ -275,7 +328,7 @@ class ICLoraPipeline:
         cleanup_memory()
 
         transformer = self.stage_2_model_ledger.transformer()
-        distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
+        distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.stage_2_device)
 
         def second_stage_denoising_loop(
             sigmas: torch.Tensor, video_state: LatentState, audio_state: LatentState, stepper: DiffusionStepProtocol
@@ -299,19 +352,19 @@ class ICLoraPipeline:
             width=stage_2_output_shape.width,
             video_encoder=video_encoder,
             dtype=self.dtype,
-            device=self.device,
+            device=self.stage_2_device,
         )
 
         video_state, audio_state = denoise_audio_video(
             output_shape=stage_2_output_shape,
             conditionings=stage_2_conditionings,
-            noiser=noiser,
+            noiser=stage_2_noiser,
             sigmas=distilled_sigmas,
             stepper=stepper,
             denoising_loop_fn=second_stage_denoising_loop,
-            components=self.pipeline_components,
+            components=self.stage_2_pipeline_components,
             dtype=dtype,
-            device=self.device,
+            device=self.stage_2_device,
             noise_scale=distilled_sigmas[0],
             initial_video_latent=upscaled_video_latent,
             initial_audio_latent=audio_state.latent,
@@ -323,7 +376,7 @@ class ICLoraPipeline:
         cleanup_memory()
 
         decoded_video = vae_decode_video(
-            video_state.latent, self.stage_2_model_ledger.video_decoder(), tiling_config, generator
+            video_state.latent, self.stage_2_model_ledger.video_decoder(), tiling_config, stage_2_generator
         )
         decoded_audio = vae_decode_audio(
             audio_state.latent, self.stage_2_model_ledger.audio_decoder(), self.stage_2_model_ledger.vocoder()
@@ -518,9 +571,54 @@ def main() -> None:
         default=None,
         help="Optional output path where prompt embeddings should be saved before generation.",
     )
+    parser.add_argument(
+        "--stage-1-device",
+        type=str,
+        default=None,
+        help="Optional device for Stage 1 inference, e.g. cuda:0 or cpu. Defaults to the pipeline device.",
+    )
+    parser.add_argument(
+        "--stage-2-device",
+        type=str,
+        default=None,
+        help="Optional device for Stage 2 inference. Defaults to the Stage 1 device.",
+    )
+    parser.add_argument(
+        "--stage-1-transformer-devices",
+        type=str,
+        default=None,
+        help="Optional comma-separated device list for Stage 1 transformer block sharding.",
+    )
+    parser.add_argument(
+        "--stage-1-transformer-split",
+        type=int,
+        default=None,
+        help="Optional Stage 1 transformer split index for two-device sharding.",
+    )
+    parser.add_argument(
+        "--stage-2-transformer-devices",
+        type=str,
+        default=None,
+        help="Optional comma-separated device list for Stage 2 transformer block sharding.",
+    )
+    parser.add_argument(
+        "--stage-2-transformer-split",
+        type=int,
+        default=None,
+        help="Optional Stage 2 transformer split index for two-device sharding.",
+    )
     args = parser.parse_args()
     if args.prompt_embeddings is not None and args.save_prompt_embeddings is not None:
         raise ValueError("Use either --prompt-embeddings or --save-prompt-embeddings, not both.")
+
+    stage_1_device = torch.device(args.stage_1_device) if args.stage_1_device is not None else device
+    stage_2_device = torch.device(args.stage_2_device) if args.stage_2_device is not None else stage_1_device
+    stage_1_transformer_devices = _parse_device_list(args.stage_1_transformer_devices)
+    stage_2_transformer_devices = _parse_device_list(args.stage_2_transformer_devices)
+    if args.stage_1_transformer_split is not None and stage_1_transformer_devices is None:
+        raise ValueError("--stage-1-transformer-split requires --stage-1-transformer-devices")
+    if args.stage_2_transformer_split is not None and stage_2_transformer_devices is None:
+        raise ValueError("--stage-2-transformer-split requires --stage-2-transformer-devices")
 
     # Load mask video if provided via --conditioning-attention-mask
     conditioning_attention_mask = None
@@ -533,6 +631,7 @@ def main() -> None:
             height=args.height // 2,  # Stage 1 operates at half resolution
             width=args.width // 2,
             num_frames=args.num_frames,
+            device=stage_1_device,
         )
 
     pipeline = ICLoraPipeline(
@@ -540,7 +639,13 @@ def main() -> None:
         spatial_upsampler_path=args.spatial_upsampler_path,
         gemma_root=args.gemma_root,
         loras=tuple(args.lora) if args.lora else (),
+        device=stage_1_device,
+        stage_2_device=stage_2_device,
         quantization=args.quantization,
+        stage_1_transformer_devices=stage_1_transformer_devices,
+        stage_1_transformer_split=args.stage_1_transformer_split,
+        stage_2_transformer_devices=stage_2_transformer_devices,
+        stage_2_transformer_split=args.stage_2_transformer_split,
     )
     prompt_embeddings = None
     if args.prompt_embeddings is not None:
@@ -582,6 +687,7 @@ def _load_mask_video(
     height: int,
     width: int,
     num_frames: int,
+    device: torch.device,
 ) -> torch.Tensor:
     """Load a mask video and return a pixel-space tensor of shape (1, 1, F, H, W).
     The mask video is loaded, resized to (height, width), converted to
@@ -629,6 +735,15 @@ def _read_lora_reference_downscale_factor(lora_path: str) -> int:
     except Exception as e:
         logging.warning(f"Failed to read metadata from LoRA file '{lora_path}': {e}")
         return 1
+
+
+def _parse_device_list(devices: str | None) -> tuple[torch.device, ...] | None:
+    if devices is None:
+        return None
+    parsed = tuple(torch.device(device.strip()) for device in devices.split(",") if device.strip())
+    if not parsed:
+        raise ValueError("Device list must contain at least one device.")
+    return parsed
 
 
 if __name__ == "__main__":
